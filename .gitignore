@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Windows
+*.lnk
+Thumbs.db
+.DS_Store
+*.bak
+
+# Testing
+test_*.py
+cloned_*/
