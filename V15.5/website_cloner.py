@@ -17,17 +17,20 @@ import subprocess
 import hashlib
 import threading
 import traceback
+import random
 from urllib.parse import urljoin, urlparse, urlunparse, unquote
 from pathlib import Path, PurePosixPath
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "V15.5"
-MAX_RETRIES = 10
-RETRY_BACKOFF = 0.3
+VERSION = "V16.0"
+MAX_RETRIES = 3  # 降低重试次数（原10次太多导致卡死）
+RETRY_BACKOFF = 1.0  # 增加基础等待时间
 CONNECT_TIMEOUT = 4
 READ_TIMEOUT = 12
-REQUEST_DELAY = 0.005
-MAX_WORKERS = 64
+REQUEST_DELAY = 0.05  # 增加请求间隔（原0.005太快易被限流）
+MAX_WORKERS = 32  # 降低并发（原64太高易被限流）
+MAX_CRAWL_TIME = 600  # 最大爬取时间600秒（10分钟）
+DOWNLOAD_TIMEOUT = 30  # 单个下载超时30秒
 
 
 def _msg_box(message, title="提示", style=0x40):
@@ -184,13 +187,13 @@ def normalize_url(url):
     return urlunparse((p.scheme, p.netloc, p.path, "", p.query, ""))
 
 
-# ===================== 智能进度条（只增不减） =====================
+# ===================== 智能进度条（只增不减 + 超时机制） =====================
 class SmartProgress:
     """
-    V15.5 核心改进: 进度条只增不减
-    - 预扫描确定总数后固定, 不再动态增加
-    - 阶段切换时不重置done, 而是累积
-    - 消除进度条倒退现象
+    V16.0 改进: 进度条超时机制 + 自动完成检测
+    - 预扫描确定总数后固定
+    - 支持超时强制完成（爬取时间过长时）
+    - 支持动态增加total（当发现预估不准时）
     """
     def __init__(self):
         self.lock = threading.Lock()
@@ -202,22 +205,26 @@ class SmartProgress:
         self.last_render = 0
         self.current = ""
         self.phase = "初始化"
+        self._force_complete = False
+        self._last_activity = time.time()  # 最后活动时间
+        self._no_progress_count = 0  # 无进展计数
 
     def set_total(self, n):
         """设置固定总数（预扫描后调用一次）"""
         with self.lock:
-            self.total = max(self.total, n)
+            if n > self.total:
+                self.total = n
 
     def add_total(self, n):
-        """只在预扫描阶段使用，预扫描结束后不再调用"""
+        """增加总数（发现预估不准时使用）"""
         with self.lock:
             self.total += n
 
     def set_phase(self, phase):
-        """切换阶段，不重置done和total"""
+        """切换阶段"""
         with self.lock:
             self.phase = phase
-            self.last_render = 0  # 强制下次刷新
+            self.last_render = 0
 
     def set_current(self, desc):
         with self.lock:
@@ -226,6 +233,8 @@ class SmartProgress:
     def step(self, cost=None, nbytes=0):
         with self.lock:
             self.done += 1
+            self._last_activity = time.time()
+            self._no_progress_count = 0
             if cost is not None:
                 self.recent.append(cost)
                 if len(self.recent) > 20:
@@ -236,19 +245,42 @@ class SmartProgress:
                 self.recent_bytes = [t for t in self.recent_bytes if t[0] > cutoff]
             self._render()
 
+    def check_timeout(self, max_time=600):
+        """检查是否超时"""
+        with self.lock:
+            elapsed = time.time() - self.start
+            if elapsed > max_time:
+                self._force_complete = True
+                return True
+            # 检查是否长时间无进展
+            if self.total > 0 and self.done > 0:
+                progress_ratio = self.done / max(self.total, 1)
+                if progress_ratio < 0.5:  # 如果进度不到50%
+                    time_since_activity = time.time() - self._last_activity
+                    if time_since_activity > 60:  # 超过60秒无活动
+                        self._no_progress_count += 1
+                    if self._no_progress_count > 3:  # 连续3次检查无进展
+                        self._force_complete = True
+                        return True
+            return False
+
     def _render(self):
         now = time.time()
         if now - self.last_render < 0.08 and self.done < self.total:
             return
         self.last_render = now
         elapsed = now - self.start
-        total = max(self.total, self.done)
-        pct = self.done / total if total else 0
+        # 如果已完成或强制完成，显示100%
+        if self._force_complete or (self.total > 0 and self.done >= self.total):
+            pct = 1.0
+        else:
+            total = max(self.total, self.done)
+            pct = self.done / total if total else 0
         bw = 30
         filled = int(bw * pct)
         bar = "#" * filled + "-" * (bw - filled)
-        avg = (sum(self.recent) / len(self.recent)) if self.recent else (elapsed / self.done if self.done else 0)
-        eta = self._fmt(max(0, (total - self.done)) * avg)
+        avg = (sum(self.recent) / len(self.recent)) if self.recent else (elapsed / max(self.done, 1))
+        eta = self._fmt(max(0, (self.total - self.done)) * avg) if not self._force_complete else "完成"
         el = self._fmt(elapsed)
         if self.recent_bytes:
             bps = sum(b for _, b in self.recent_bytes) / max(1, now - self.recent_bytes[0][0])
@@ -256,8 +288,9 @@ class SmartProgress:
         else:
             speed = "-"
         cur = self.current
+        force_note = " [超时完成]" if self._force_complete else ""
         sys.stdout.write(
-            f"\r[{self.phase}] {bar} {pct:5.1%} | {self.done}/{total} | {speed}/s | {el} | 剩余{eta} | {cur}   "
+            f"\r[{self.phase}] {bar} {pct:5.1%} | {self.done}/{self.total} | {speed}/s | {el} | 剩余{eta}{force_note} | {cur}   "
         )
         sys.stdout.flush()
 
@@ -282,7 +315,7 @@ class SmartProgress:
 
     def finish(self):
         with self.lock:
-            self.done = self.total = max(self.done, self.total)
+            self.done = self.total = max(self.done, self.total, 1)
             self._render()
         sys.stdout.write("\n\n")
         sys.stdout.flush()
@@ -298,9 +331,91 @@ class SmartProgress:
             self.last_render = 0
             self.current = ""
             self.phase = "克隆中"
+            self._force_complete = False
+            self._last_activity = time.time()
+            self._no_progress_count = 0
 
 
 PROGRESS = SmartProgress()
+
+
+# ===================== 轻量级代理池 =====================
+class SimpleProxyPool:
+    """简单代理池 - 用于网站克隆器加速"""
+    
+    PROXY_SOURCES = [
+        "https://api.proxyscrape.com/v3/free-proxy-list/get?request=display_proxies&proxy_format=ipport&format=text",
+        "https://api.openproxylist.xyz/http.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    ]
+    
+    def __init__(self):
+        self.proxies = []
+        self.initialized = False
+        self.best_proxy = None
+    
+    def initialize(self):
+        """初始化代理池"""
+        if self.initialized:
+            return
+        
+        log("初始化代理池...", "INFO")
+        
+        # 获取代理
+        all_proxies = []
+        for source in self.PROXY_SOURCES:
+            try:
+                r = requests.get(source, timeout=8, headers={"User-Agent": USER_AGENT})
+                if r.status_code == 200:
+                    for line in r.text.strip().split("\n"):
+                        line = line.strip()
+                        if ":" in line:
+                            all_proxies.append(line)
+            except Exception:
+                continue
+        
+        # 去重
+        all_proxies = list(set(all_proxies))[:50]
+        log(f"获取到 {len(all_proxies)} 个代理，测试中...", "INFO")
+        
+        # 测试代理
+        valid = []
+        for proxy_str in all_proxies:
+            try:
+                host, port = proxy_str.split(":")
+                port = int(port)
+                proxies = {"http": f"http://{host}:{port}", "https": f"http://{host}:{port}"}
+                start = time.time()
+                r = requests.get("https://www.google.com", proxies=proxies, timeout=5, verify=False)
+                if r.status_code < 400:
+                    latency = time.time() - start
+                    valid.append({"host": host, "port": port, "latency": latency})
+            except Exception:
+                continue
+        
+        # 按延迟排序
+        valid.sort(key=lambda x: x["latency"])
+        self.proxies = valid
+        self.best_proxy = valid[0] if valid else None
+        self.initialized = True
+        
+        if self.best_proxy:
+            log(f"代理池就绪！最优: {self.best_proxy['host']}:{self.best_proxy['port']} ({self.best_proxy['latency']:.2f}s)", "SUCCESS")
+        else:
+            log("代理池未找到可用代理", "WARN")
+    
+    def get_proxy(self):
+        """获取最优代理"""
+        if not self.initialized:
+            self.initialize()
+        if self.best_proxy:
+            p = self.best_proxy
+            return {"http": f"http://{p['host']}:{p['port']}", "https": f"http://{p['host']}:{p['port']}"}
+        return None
+
+
+CLONER_PROXY_POOL = SimpleProxyPool()
 
 
 # ===================== B站视频下载器 =====================
@@ -423,10 +538,10 @@ class WebsiteCloner:
             "Accept-Encoding": "gzip, deflate",
             "Connection": "keep-alive",
         })
-        retry = Retry(total=MAX_RETRIES, backoff_factor=0.4,
+        retry = Retry(total=2, backoff_factor=0.5,  # 降低重试次数
                       status_forcelist=(500, 502, 503, 504),
                       allowed_methods=frozenset(["GET"]))
-        ad = HTTPAdapter(pool_connections=32, pool_maxsize=64, max_retries=retry)
+        ad = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=retry)
         s.mount("http://", ad)
         s.mount("https://", ad)
         return s
@@ -473,30 +588,27 @@ class WebsiteCloner:
         max_tries = MAX_RETRIES
         for attempt in range(max_tries):
             try:
-                time.sleep(REQUEST_DELAY)
+                # 添加随机延迟避免被限流
+                time.sleep(REQUEST_DELAY * (0.5 + 0.5 * (attempt + 1)) + random.uniform(0, 0.1))
                 r = self.session.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
                                      allow_redirects=True, stream=stream)
                 if r.status_code < 400:
                     return r
                 if r.status_code in (403, 429):
                     last = f"HTTP {r.status_code}"
-                    if attempt in (0, 2, 4, 8):
-                        log(f"  被限流({last}) 第{attempt+1}/{max_tries}次: {safe_name(url)[:40]}", "WARN")
-                    time.sleep(RETRY_BACKOFF * (2 ** attempt))
+                    if attempt < max_tries - 1:
+                        wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 0.5)
+                        time.sleep(wait)
                     continue
                 return r
             except requests.exceptions.Timeout:
                 last = "超时"
-                remain = max_tries - attempt - 1
-                if attempt in (0, 2, 4, 8):
-                    log(f"  下载超时 第{attempt+1}/{max_tries}次，剩余{remain}次: {safe_name(url)[:40]}", "WARN")
-                time.sleep(RETRY_BACKOFF * (2 ** attempt))
+                if attempt < max_tries - 1:
+                    time.sleep(RETRY_BACKOFF * (2 ** attempt))
             except requests.RequestException as e:
                 last = e.__class__.__name__
-                remain = max_tries - attempt - 1
-                if attempt in (0, 2, 4, 8):
-                    log(f"  请求失败({last}) 第{attempt+1}/{max_tries}次，剩余{remain}次: {safe_name(url)[:40]}", "WARN")
-                time.sleep(RETRY_BACKOFF * (2 ** attempt))
+                if attempt < max_tries - 1:
+                    time.sleep(RETRY_BACKOFF)
         if last:
             self.failed_urls.add(url)
             log(f"  下载失败({last}) {max_tries}次重试用尽: {safe_name(url)[:40]}", "ERROR")
@@ -530,11 +642,13 @@ class WebsiteCloner:
         if r and r.status_code < 400:
             html = r.text
             final = normalize_url(r.url)
-        if (html is None or len(html.strip()) < 500) and self.use_js:
+        # 降低阈值从500到100字符（有些有效页面内容较短）
+        if (html is None or len(html.strip()) < 100) and self.use_js:
             log(f"动态渲染: {url}")
             h2, f2 = self._render_js(url)
             if h2:
                 return h2, f2
+            # 如果JS渲染也失败，保留原始结果（即使很短）
         return html, final
 
     # ===================== 预扫描（V15.5核心改进） =====================
@@ -979,16 +1093,40 @@ class WebsiteCloner:
         PROGRESS.set_total(total_tasks)
         log(f"[预扫描] 预估总任务数: {total_tasks} (页面:{total_pages}, 资源:{len(asset_urls)}+预估{estimated_sub_assets})")
 
-        # ========== 阶段2: 下载首页资源 ==========
-        PROGRESS.set_phase("下载资源")
+        # ========== 阶段2: 爬取页面 ==========
+        PROGRESS.set_phase("爬取页面")
 
         # 先下载首页
         self.queue.append((self.start_url, 0))
+        crawled_count = 0
         while self.queue and STATS.pages_ok + STATS.pages_fail < self.max_pages:
+            # 超时检查
+            if PROGRESS.check_timeout(MAX_CRAWL_TIME):
+                log("爬取超时，正在完成当前任务...", "WARN")
+                break
+            
             url, depth = self.queue.pop(0)
             if url in self.visited:
                 continue
-            self.queue.extend(self.clone_page(url, depth))
+            
+            # 动态增加总数（每发现新页面增加预估）
+            crawled_count += 1
+            
+            try:
+                new_pages = self.clone_page(url, depth)
+                self.queue.extend(new_pages)
+                
+                # 动态调整进度条总数
+                actual_tasks = (STATS.pages_ok + STATS.pages_fail + 
+                              STATS.assets_ok + STATS.assets_fail)
+                estimated_remaining = len(self.queue) * 10  # 预估每个页面10个资源
+                if PROGRESS.total < actual_tasks + estimated_remaining:
+                    PROGRESS.set_total(actual_tasks + estimated_remaining)
+                    
+            except Exception as e:
+                log(f"页面克隆异常: {e}", "ERROR")
+                STATS.pages_fail += 1
+                PROGRESS.step()
 
         self.close_js()
 
@@ -1124,11 +1262,55 @@ def show_result_popup():
 
 
 def main():
-    print("=" * 60)
-    print(f"       网站克隆器 {VERSION}  Website Cloner")
-    print("       预扫描 | 智能进度条 | 视频下载")
-    print("=" * 60)
+    print("""
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║       网站克隆器 V16.0  Website Cloner                      ║
+║       预扫描 | 智能进度条 | 视频下载 | 代理加速              ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ⚠️  重要提示 / IMPORTANT
+  在使用本软件之前，请务必查看 README 文档：
+  Before using this software, please read the README first:
+  
+  📖 中文文档: README.md
+  📖 English:   README_EN.md
+  
+  包含: 安装说明、使用教程、常见问题解答
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+""")
+    
+    # 询问是否阅读 README
+    try:
+        ack = input("您是否已阅读 README 文档？(y=是/n=否，继续使用请输入y): ").strip().lower()
+        if ack != 'y':
+            print("\n" + "="*60)
+            print("📖 请先查看 README 文档获取详细使用说明！")
+            print("📖 Please read the README documentation for detailed instructions!")
+            print("="*60)
+            try:
+                input("\n按回车键退出...")
+            except:
+                pass
+            return
+    except (EOFError, KeyboardInterrupt):
+        print("\n再见！")
+        return
+    
+    # 初始化代理池
+    use_proxy = False
+    try:
+        proxy_choice = input("\n是否初始化代理池用于加速？(y=是/n=否，默认n): ").strip().lower()
+        if proxy_choice == 'y':
+            print("正在初始化代理池...")
+            CLONER_PROXY_POOL.initialize()
+            use_proxy = CLONER_PROXY_POOL.best_proxy is not None
+    except Exception:
+        pass
+    
     while True:
         print("\n请选择模式:")
         print("  1. 简单打包 - 可选择爬取深度(1-12)")
@@ -1166,11 +1348,20 @@ def main():
 
     print(f"\n开始克隆: {url}")
     print(f"深度: {depth}, 页面上限: {max_pages}")
+    print(f"代理: {'开启' if use_proxy else '关闭'}")
     print(f"输出目录: {out_root}")
     print("-" * 60)
 
     cloner = WebsiteCloner(url, out_root, max_depth=depth, max_pages=max_pages,
                            use_js=True, include_external=True)
+    
+    # 应用代理
+    if use_proxy:
+        proxy = CLONER_PROXY_POOL.get_proxy()
+        if proxy:
+            cloner.session.proxies.update(proxy)
+            log(f"已应用代理: {proxy.get('http', '')}", "INFO")
+    
     entry = cloner.run()
 
     total_pages = STATS.pages_ok + STATS.pages_fail
@@ -1211,11 +1402,19 @@ def main():
 
         print(f"\n开始克隆: {url}")
         print(f"深度: {depth}, 页面上限: {max_pages}")
+        print(f"代理: {'开启' if use_proxy else '关闭'}")
         print(f"输出目录: {out_root}")
         print("-" * 60)
 
         cloner = WebsiteCloner(url, out_root, max_depth=depth, max_pages=max_pages,
                                use_js=True, include_external=True)
+        
+        # 应用代理
+        if use_proxy and CLONER_PROXY_POOL.best_proxy:
+            proxy = CLONER_PROXY_POOL.get_proxy()
+            if proxy:
+                cloner.session.proxies.update(proxy)
+        
         entry = cloner.run()
 
         total_pages = STATS.pages_ok + STATS.pages_fail
